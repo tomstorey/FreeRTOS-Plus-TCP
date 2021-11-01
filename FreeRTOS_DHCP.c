@@ -1131,7 +1131,7 @@
     static BaseType_t prvSendDHCPDiscover( void )
     {
         BaseType_t xResult = pdFAIL;
-        uint8_t const * pucUDPPayloadBuffer;
+        uint8_t * pucUDPPayloadBuffer;
         struct freertos_sockaddr xAddress;
         static const uint8_t ucDHCPDiscoverOptions[] =
         {
