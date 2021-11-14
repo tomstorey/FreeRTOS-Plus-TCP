@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 /* FreeRTOS includes. */
 #include "FreeRTOS.h"
@@ -416,117 +417,136 @@ typedef struct {
     } TMD3;
 } LANCE_Tx_Descriptor_t;
 
-/* FreeRTOS only has a single pool of buffers that is shared between TX and RX.
- * Therefore, and due to the available buffer count options provided by the
- * LANCE, an even power of 2 number of buffers must be configured. Then, half
- * of those buffers will be allocated during initialisation to the RX ring.
- * TODO: make the TX ring a bit smaller in future? */
-#if ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS < 2
-#error "Even number of buffers is required, and must be a power of 2"
-#endif
-
-#if ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS > 256
-#error "LANCE supports a maximum of 128 buffers per ring, therefore ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS must be <= 256"
-#endif
-
-/* TX_RING_SZ and RX_RING_SZ are the number of entries in the descriptor rings */
-#define TX_RING_SZ (ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS / 2)
-#define RX_RING_SZ (ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS / 2)
-
 /* Define ring lengths here, makes VSCode more happy */
 #define RX_RING_LEN 0
 #define TX_RING_LEN 0
 
-#if TX_RING_SZ == 1
+#if LANCE_RX_RING_SZ == 1
 /* Already defined, so ignore */
-#elif TX_RING_SZ == 2
-#undef TX_RING_LEN
-#define TX_RING_LEN 1
-#elif TX_RING_SZ == 4
-#undef TX_RING_LEN
-#define TX_RING_LEN 2
-#elif TX_RING_SZ == 8
-#undef TX_RING_LEN
-#define TX_RING_LEN 3
-#elif TX_RING_SZ == 16
-#undef TX_RING_LEN
-#define TX_RING_LEN 4
-#elif TX_RING_SZ == 32
-#undef TX_RING_LEN
-#define TX_RING_LEN 5
-#elif TX_RING_SZ == 64
-#undef TX_RING_LEN
-#define TX_RING_LEN 6
-#elif TX_RING_SZ == 128
-#undef TX_RING_LEN
-#define TX_RING_LEN 7
-#else
-#error "Invalid TX ring size"
-#endif
-
-#if RX_RING_SZ == 1
-/* Already defined, so ignore */
-#elif RX_RING_SZ == 2
+#elif LANCE_RX_RING_SZ == 2
 #undef RX_RING_LEN
 #define RX_RING_LEN 1
-#elif RX_RING_SZ == 4
+#elif LANCE_RX_RING_SZ == 4
 #undef RX_RING_LEN
 #define RX_RING_LEN 2
-#elif RX_RING_SZ == 8
+#elif LANCE_RX_RING_SZ == 8
 #undef RX_RING_LEN
 #define RX_RING_LEN 3
-#elif RX_RING_SZ == 16
+#elif LANCE_RX_RING_SZ == 16
 #undef RX_RING_LEN
 #define RX_RING_LEN 4
-#elif RX_RING_SZ == 32
+#elif LANCE_RX_RING_SZ == 32
 #undef RX_RING_LEN
 #define RX_RING_LEN 5
-#elif RX_RING_SZ == 64
+#elif LANCE_RX_RING_SZ == 64
 #undef RX_RING_LEN
 #define RX_RING_LEN 6
-#elif RX_RING_SZ == 128
+#elif LANCE_RX_RING_SZ == 128
 #undef RX_RING_LEN
 #define RX_RING_LEN 7
 #else
-#error "Invalid RX ring size"
+#error "Invalid RX ring size, must be one of: 1, 2, 4, 8, 16, 32, 64 or 128"
 #endif
+
+#if LANCE_TX_RING_SZ == 1
+/* Already defined, so ignore */
+#elif LANCE_TX_RING_SZ == 2
+#undef TX_RING_LEN
+#define TX_RING_LEN 1
+#elif LANCE_TX_RING_SZ == 4
+#undef TX_RING_LEN
+#define TX_RING_LEN 2
+#elif LANCE_TX_RING_SZ == 8
+#undef TX_RING_LEN
+#define TX_RING_LEN 3
+#elif LANCE_TX_RING_SZ == 16
+#undef TX_RING_LEN
+#define TX_RING_LEN 4
+#elif LANCE_TX_RING_SZ == 32
+#undef TX_RING_LEN
+#define TX_RING_LEN 5
+#elif LANCE_TX_RING_SZ == 64
+#undef TX_RING_LEN
+#define TX_RING_LEN 6
+#elif LANCE_TX_RING_SZ == 128
+#undef TX_RING_LEN
+#define TX_RING_LEN 7
+#else
+#error "Invalid TX ring size, must be one of: 1, 2, 4, 8, 16, 32, 64 or 128"
+#endif
+
+/* The MAC handling task should run at max priority to ensure speedy handling
+ * of ethernet events */
+#define MAC_TASK_PRIORITY (configMAX_PRIORITIES - 1)
+
+/* The number of entries the MAC task queue can hold. Should cover at least the
+ * number of buffer descriptors that are allocated */
+#define MAC_TASK_QUEUE_SZ (ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS + 10)
 
 /* Reserve some space statically to hold the Initialisation Block */
 uint16_t LANCE_Init_Block[12] __attribute__((section(".iomem")));
 
 /* Reserve space for the transmit descriptor ring, which must be aligned to
  * 8 bytes. */
-LANCE_Tx_Descriptor_t LANCE_Tx_Descriptor_Ring[TX_RING_SZ] __attribute__((aligned(8), section(".iomem")));
+LANCE_Tx_Descriptor_t LANCE_Tx_Descriptor_Ring[LANCE_TX_RING_SZ] __attribute__((aligned(8), section(".iomem")));
 
 /* Reserve space for the receive descriptor ring. Sizing/alignment is the same
  * as the transmit descriptor ring. */
-LANCE_Rx_Descriptor_t LANCE_Rx_Descriptor_Ring[RX_RING_SZ] __attribute__((aligned(8), section(".iomem")));
+LANCE_Rx_Descriptor_t LANCE_Rx_Descriptor_Ring[LANCE_RX_RING_SZ] __attribute__((aligned(8), section(".iomem")));
 
-/* Reserve space for TX/RX buffers. One pool is used to manage both, and is
- * divided in two, with one half initially being assigned to the RX ring. The
- * other half is thus available for the TX ring as required. Although the LANCE
- * doesnt have any special alignment requirements, FreeRTOS likes to have a
- * pointer to the descriptor that the buffer belongs to stored before the
- * actual buffer itself, and that pointer will need to be word aligned.
- * Therefore, ensure that each buffer is an even number of bytes long, and tell
- * the compiler to align the buffer allocation itself to a word boundary. */
+/* Reserve space for TX/RX buffers. One pool is used to manage both TX and RX.
+ * Although the LANCE doesnt have any special alignment requirements, FreeRTOS
+ * likes to have a pointer to the descriptor that the buffer belongs to stored
+ * before the actual buffer itself, and that pointer needs to be long aligned.
+ * Therefore, ensure that each buffer is a multiple of 4 bytes long, and tell
+ * the compiler to align the buffer allocation itself to a long boundary. */
 #define BUFFER_SIZE (ipTOTAL_ETHERNET_FRAME_SIZE + ipBUFFER_PADDING)
-#define BUFFER_SIZE_ROUNDED_UP ((BUFFER_SIZE + 1) & ~0x1UL)
-uint8_t LANCE_Buffers[ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS][BUFFER_SIZE_ROUNDED_UP] __attribute__((aligned(2), section(".iomem")));
+#define BUFFER_SIZE_ROUNDED_UP ((BUFFER_SIZE + 3) & ~0x3UL)
+uint8_t LANCE_Buffers[ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS][BUFFER_SIZE_ROUNDED_UP] __attribute__((aligned(4), section(".iomem")));
 
 /* Transmit tail and head indexes, referencing the index of the next available
  * transmit descriptor (head), and the index of the currently transmitting
  * descriptor (tail) */
-static uint8_t tx_tail_idx = 0;
-static uint8_t tx_head_idx = 0;
+static volatile uint8_t tx_tail_idx = 0;
+static volatile uint8_t tx_head_idx = 0;
 
-/* Stores the value of xReleaseAfterSend that was provided to
- * xNetworkInterfaceOutput(), and is used on completion of packet TX to
- * determine whether the buffers should be released or not. */
-static BaseType_t relase_after_sends[TX_RING_SZ] = {0};
+/* Receive tail and head indexes, referencing the index of the next descriptor
+ * where a packet can be received (head), and the index of the descriptor
+ * containing the oldest packet received (tail). */
+static volatile uint8_t rx_tail_idx = 0;
+static volatile uint8_t rx_head_idx = 0;
+
+/* A task handle for the task which will manage ongoing operation of the LANCE,
+ * like passing RX packets, releasing TX descriptors, errors etc */
+static TaskHandle_t mac_task_handle = NULL;
+
+/* A queue that holds events related to the LANCE. This can be TX complete, RX
+ * packet, and other events like errors that need to be handled */
+static QueueHandle_t mac_task_queue = NULL;
+
+
+typedef enum {
+    MAC_EVT_PASS = -1,
+    MAC_EVT_NONE = 0,
+    MAC_EVT_TX_COMPLETE,
+    MAC_EVT_RX_COMPLETE,
+    MAC_EVT_SHUTDOWN,
+} mac_task_event_t;
 
 
 
+
+/* Private function prototypes */
+static void release_allocated_descriptors(uint8_t numbufs);
+static void LANCE_stop(void);
+static void mac_task(void * pvParameters);
+static void mac_task_tx(void);
+static void mac_task_rx(void);
+static void mac_task_shutdown(void);
+
+
+
+static volatile uint32_t debug = 0;
 
 
 
@@ -550,6 +570,17 @@ release_allocated_descriptors(uint8_t numbufs)
     }
 }
 
+
+static void
+LANCE_stop(void)
+{
+    /* Set the STOP bit of CSR0 to place the LANCE into a reset state */
+    LANCE_RAPbits.CSR = 0;
+    LANCE_CSR0bits.STOP = 1;
+}
+
+
+
 BaseType_t
 xNetworkInterfaceInitialise(void)
 {
@@ -562,6 +593,9 @@ xNetworkInterfaceInitialise(void)
     NetworkBufferDescriptor_t *buf;
     uint8_t numbufs = 0;
     const uint16_t *mac_addr;
+
+    /* Ensure the STOP bit of CSR0 is set to ready for init */
+    LANCE_stop();
 
     /* Set up pointers to initialisation block, buffers etc */
     ib = (LANCE_Init_Block_t *)&LANCE_Init_Block;
@@ -593,9 +627,11 @@ xNetworkInterfaceInitialise(void)
 
     /* Initialise RX descriptor ring - each buffer initially is owned by the
      * LANCE. */
-    for (index = 0; index < RX_RING_SZ; index++) {
+    for (index = 0; index < LANCE_RX_RING_SZ; index++) {
         /* Get a buffer to assign to descriptor */
         buf = pxGetNetworkBufferWithDescriptor(BUFFER_SIZE_ROUNDED_UP, 0);
+
+        configASSERT(buf != NULL);
 
         if (buf == NULL) {
             /* If buffer allocation fails, network has not initialised. Break
@@ -623,7 +659,7 @@ xNetworkInterfaceInitialise(void)
     /* Initialise TX descriptor ring - each buffer initially is owned by the
      * host, and has a null pointer which will be updated to point to a buffer
      * when a frame needs to be transmitted. */
-    for (index = 0; index < TX_RING_SZ; index++) {
+    for (index = 0; index < LANCE_TX_RING_SZ; index++) {
         /* Lower 16 bits of buffer address - fill with index value for debug */
         tdrp[index].TMD0.u16 = 0;
         
@@ -637,7 +673,7 @@ xNetworkInterfaceInitialise(void)
         tdrp[index].TMD3.u16 = 0;
     }
 
-    if (numbufs < RX_RING_SZ) {
+    if (numbufs < LANCE_RX_RING_SZ) {
         /* Not all buffers were allocated, which means that initialisation
          * failed. Release the buffers that were allocated and then return
          * false to fail the initialisation process. */
@@ -645,10 +681,6 @@ xNetworkInterfaceInitialise(void)
 
         return pdFALSE;
     }
-
-    /* Set STOP bit of CSR0 to reset and ensure LANCE is ready for init */
-    LANCE_RAPbits.CSR = 0;
-    LANCE_CSR0bits.STOP = 1;
 
     /* Set the address of the IB in the LANCE CSRs and tell it to initialise */
     LANCE_RAPbits.CSR = 1;
@@ -681,6 +713,7 @@ xNetworkInterfaceInitialise(void)
 
     if (ctr == 0) {
         /* Initialisation failed */
+        LANCE_stop();
         release_allocated_descriptors(numbufs);
 
         return pdFALSE;
@@ -692,11 +725,251 @@ xNetworkInterfaceInitialise(void)
 
     while ((LANCE_CSR0 & 0x0030) != 0x0030);
 
+    /* Create the MAC handler task and related infrastructure */
+    if (mac_task_handle == NULL) {
+        if (xTaskCreate(mac_task,
+                        "LANCE MAC task",
+                        4096,
+                        NULL,
+                        MAC_TASK_PRIORITY,
+                        &mac_task_handle) != pdPASS) {
+            /* Failed to create task */
+            LANCE_stop();
+            release_allocated_descriptors(numbufs);
+
+            return pdFALSE;
+        }
+
+        mac_task_queue = xQueueCreate(MAC_TASK_QUEUE_SZ,
+                                      sizeof(mac_task_event_t));
+    }
+
     /* Done, return success */
     return pdTRUE;
 }
 
-void vNetworkInterfaceAllocateRAMToBuffers(
+
+
+
+static void
+mac_task(void * pvParameters)
+{
+    mac_task_event_t event;
+    uint16_t ctr = 0;
+
+    while (true) {
+        debug &= 0xFFFF0000;
+        debug |= ctr;
+        *(uint32_t *)(0x03000000) = debug;
+
+        if (xQueueReceive(mac_task_queue,
+                          (mac_task_event_t *)&event,
+                          10) != pdPASS) {
+            /* Failed to get an item from the queue, wait again */
+            ctr++;
+            continue;
+        }
+
+        ctr = 0;
+        
+        switch (event) {
+            case MAC_EVT_TX_COMPLETE:
+                mac_task_tx();
+
+                break;
+            
+            case MAC_EVT_RX_COMPLETE:
+                mac_task_rx();
+
+                break;
+
+            case MAC_EVT_SHUTDOWN:
+                mac_task_shutdown();
+
+                break;
+
+            default:
+                /* Undefined event type, ignore it */
+        }
+    }
+}
+
+static void
+mac_task_tx(void)
+{
+    LANCE_Tx_Descriptor_t *td;
+    uint8_t *buf = NULL;
+    NetworkBufferDescriptor_t *pxDescriptor;
+
+    /* A packet has been transmitted, free up descriptor/buffer at the tail of
+     * the TX ring */
+
+    /* Assign the td pointer */
+    td = &LANCE_Tx_Descriptor_Ring[tx_tail_idx];
+
+    /* Release the buffer */
+    buf = (uint8_t *)(td->TMD1.HADR << 16 | td->TMD0.LADR);
+
+    configASSERT(buf != NULL);
+
+    if (buf != NULL) {
+        pxDescriptor = pxPacketBuffer_to_NetworkBuffer((void *)buf);
+
+        configASSERT(pxDescriptor != NULL);
+
+        if (pxDescriptor != NULL) {
+            vReleaseNetworkBufferAndDescriptor(pxDescriptor);
+        }
+    }
+
+    /* Advance the tail pointer */
+    tx_tail_idx++;
+    tx_tail_idx &= (LANCE_TX_RING_SZ - 1);
+}
+
+static void
+mac_task_rx(void)
+{
+    LANCE_Rx_Descriptor_t *rd;
+    uint8_t *buf = NULL;
+    NetworkBufferDescriptor_t *pxDescriptor;
+    IPStackEvent_t xRxEvent;
+    NetworkBufferDescriptor_t *new_buf;
+
+    /* A packet has been received, pass it to the IP stack and allocate a new
+     * buffer for the ring entry */
+
+    /* Assign the rd pointer */
+    // for (ctr = LANCE_RX_RING_SZ; ctr > 0; ctr--) {
+    //     /* Find the first ring entry, starting from the last known tail index,
+    //     * with the OWN bit unset and with a non-NULL buffer pointer. This is
+    //     * intended to skip ring entries where a buffer could not be allocated
+    //     * after passing a buffer to the IP stack. */
+    //     rd = &LANCE_Rx_Descriptor_Ring[rx_tail_idx];
+
+    //     if (rd->RMD1.OWN == 0) {
+    //         buf = (uint8_t *)(rd->RMD1.HADR << 16 | rd->RMD0.LADR);
+
+    //         if (buf != NULL) {
+    //             /* Found the entry */
+    //             break;
+    //         }
+    //     }
+
+    //     /* Try the next entry */
+    //     rx_tail_idx++;
+    //     rx_tail_idx &= (LANCE_RX_RING_SZ - 1);
+    // }
+    rd = &LANCE_Rx_Descriptor_Ring[rx_tail_idx];
+
+    /* TODO: this probably needs to loop to check for additional received
+     *       packets - if multiple happened to be signalled by a single RX
+     *       interrupt */
+
+    /* TODO: check descriptor entry for errors */
+
+    /* Get pointer to payload buffer within the rx descriptor */
+    buf = (uint8_t *)(rd->RMD1.HADR << 16 | rd->RMD0.LADR);
+
+    configASSERT(buf != NULL);
+
+    if (buf != NULL) {
+        pxDescriptor = pxPacketBuffer_to_NetworkBuffer((void *)buf);
+
+        configASSERT(pxDescriptor != NULL);
+
+        if (pxDescriptor != NULL) {
+            xRxEvent.eEventType = eNetworkRxEvent;
+            xRxEvent.pvData = (void *)pxDescriptor;
+
+            pxDescriptor->xDataLength = rd->RMD3.MCNT;
+
+            if (xSendEventStructToIPTask(&xRxEvent, 0) != pdPASS) {
+                /* Couldnt pass the event to the IP stack, so drop it */
+                vReleaseNetworkBufferAndDescriptor(pxDescriptor);
+            }
+        }
+    }
+
+    /* Allocate a new buffer to the ring entry */
+    new_buf = pxGetNetworkBufferWithDescriptor(BUFFER_SIZE_ROUNDED_UP, 0);
+
+    configASSERT(new_buf != NULL);
+
+    if (new_buf != NULL) {
+        /* Reconfigure the ring entry so it can be used again */
+        rd->RMD1.u16 = 0x0000;
+        rd->RMD0.LADR = (uint32_t)new_buf->pucEthernetBuffer;
+        rd->RMD1.HADR = (uint32_t)new_buf->pucEthernetBuffer >> 16;
+        rd->RMD2.u16 = 0xF000;
+        rd->RMD2.BCNT = BUFFER_SIZE_ROUNDED_UP;
+        rd->RMD3.u16 = 0;
+        rd->RMD1.OWN = 1;
+    } else {
+        /* Null the descriptors buffer pointer as an indicator that the ring
+        * entry is unusable. OWN bit also remains unset so that the LANCE wont
+        * try to use it. */
+        rd->RMD0.u16 = 0;
+        rd->RMD1.u16 = 0;
+        rd->RMD2.u16 = 0xF000;
+        rd->RMD3.u16 = 0;
+
+        /* TODO: start some kind of timer that can try to re-attempt buffer
+        *       allocation later? */
+    }
+
+    /* Advance the tail pointer */
+    rx_tail_idx++;
+    rx_tail_idx &= (LANCE_RX_RING_SZ - 1);
+}
+
+static void
+mac_task_shutdown(void)
+{
+    LANCE_Tx_Descriptor_t *td;
+    uint8_t *buf = NULL;
+    NetworkBufferDescriptor_t *pxDescriptor;
+
+    /* LANCE has been stopped due to an error, release all buffers from the RX
+     * ring in preparation for re-initialisation */
+    release_allocated_descriptors(LANCE_RX_RING_SZ);
+
+    /* Also release any buffers used by the TX ring */
+    while (tx_tail_idx != tx_head_idx) {
+        /* Assign the td pointer */
+        td = &LANCE_Tx_Descriptor_Ring[tx_tail_idx];
+
+        /* Release the buffer */
+        buf = (uint8_t *)(td->TMD1.HADR << 16 | td->TMD0.LADR);
+
+        configASSERT(buf != NULL);
+
+        if (buf != NULL) {
+            pxDescriptor = pxPacketBuffer_to_NetworkBuffer((void *)buf);
+
+            configASSERT(pxDescriptor != NULL);
+
+            if (pxDescriptor != NULL) {
+                vReleaseNetworkBufferAndDescriptor(pxDescriptor);
+            }
+        }
+
+        /* Advance the tail pointer */
+        tx_tail_idx++;
+        tx_tail_idx &= (LANCE_TX_RING_SZ - 1);
+    }
+
+    /* TODO: Signal network down to FreeRTOS so it restarts/reinits */
+    // FreeRTOS_NetworkDown();
+}
+
+
+
+
+
+
+void
+vNetworkInterfaceAllocateRAMToBuffers(
     NetworkBufferDescriptor_t pxNetworkBuffers[ ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS ] )
 {
     uint32_t index;
@@ -713,29 +986,22 @@ void vNetworkInterfaceAllocateRAMToBuffers(
 
 
 
-
-
-
-
-
-
-BaseType_t xNetworkInterfaceOutput( NetworkBufferDescriptor_t * const pxDescriptor,
-                                    BaseType_t xReleaseAfterSend )
+BaseType_t
+xNetworkInterfaceOutput(NetworkBufferDescriptor_t * const pxDescriptor,
+                        BaseType_t xReleaseAfterSend)
 {
     LANCE_Tx_Descriptor_t *td;
-
-    printf("pxDescriptor %p\r\n", pxDescriptor);
 
     /* Check that the head index is not owned by the LANCE */
     if (LANCE_Tx_Descriptor_Ring[tx_head_idx].TMD1.OWN == 1) {
         /* If the head index is owned by the LANCE, all TX descriptors are in
-         * use */
-        /* TODO: release buffer and fail */
+         * use
+         *
+         * TODO: could make this wait and try again in a short while? */
+        vReleaseNetworkBufferAndDescriptor(pxDescriptor);
+
         return pdFALSE;
     }
-
-    /* Store xReleaseAfterSend for later */
-    relase_after_sends[tx_head_idx] = xReleaseAfterSend;
 
     /* Assign the td pointer */
     td = &LANCE_Tx_Descriptor_Ring[tx_head_idx];
@@ -750,79 +1016,22 @@ BaseType_t xNetworkInterfaceOutput( NetworkBufferDescriptor_t * const pxDescript
     /* Put buffer length into descriptor */
     td->TMD2.BCNT = -(pxDescriptor->xDataLength);
 
-    printf("pucEthernetBuffer %p\r\n", pxDescriptor->pucEthernetBuffer);
-    printf("xDataLength %d\r\n", pxDescriptor->xDataLength);
-
     /* Set descriptor flags */
     td->TMD1.STP = 1;                   /* The first buffer of this packet */
     td->TMD1.ENP = 1;                   /* ... and also the last */
     td->TMD1.ADD_FCS = 1;               /* Hardware adds checksum */
     td->TMD1.OWN = 1;                   /* LANCE will now TX */
 
-    /* Begin: Dump TD for debug */
-    uint16_t *ptr = (uint16_t *)td;
-    uint16_t ctr;
-
-    printf("TD> (%p): ", td);
-
-    for (ctr = 0; ctr < 4; ctr++) {
-        printf("%04X ", *ptr);
-        ptr++;
-    }
-
-    printf("\r\n");
-
-    uint8_t *c = pxDescriptor->pucEthernetBuffer;
-
-    for (ctr = 0; ctr < 64; ctr++) {
-        printf("%02X ", *c++);
-    }
-
-    printf("\r\n");
-    /* End: Dump TD for debug */
-
     /* Advance the head pointer */
     tx_head_idx++;
 
-    if (tx_head_idx == TX_RING_SZ) {
-        /* Wrap the head pointer at the last descriptor in the arrary */
-        tx_head_idx = 0;
-    }
+    /* Wrap the tail pointer at the last descriptor */
+    tx_head_idx &= (LANCE_TX_RING_SZ - 1);
 
     return pdTRUE;
 }
 
 
-static void
-LANCE_TX_Complete(void)
-{
-    LANCE_Tx_Descriptor_t *td;
-    uint8_t *buf;
-    NetworkBufferDescriptor_t *pxDescriptor;
-
-    /* TODO: more error handling is likely required */
-
-    /* Assign the td pointer */
-    td = &LANCE_Tx_Descriptor_Ring[tx_tail_idx];
-
-    /* Release the buffer if required */
-    if (relase_after_sends[tx_tail_idx] != pdFALSE) {
-        buf = (uint8_t *)(td->TMD1.HADR << 16 | td->TMD0.LADR);
-
-        pxDescriptor = pxPacketBuffer_to_NetworkBuffer((void *)buf);
-
-        // TODO: seems to be crashing here...
-        // vReleaseNetworkBufferAndDescriptor(pxDescriptor);
-    }
-
-    /* Advance the tail pointer */
-    tx_tail_idx++;
-
-    if (tx_tail_idx == TX_RING_SZ) {
-        /* Wrap the head pointer at the last descriptor in the arrary */
-        tx_tail_idx = 0;
-    }
-}
 
 
 
@@ -832,45 +1041,69 @@ LANCE_TX_Complete(void)
 
 
 
-
-
-void
+BaseType_t
 LANCE_Interrupt_Handler(void)
 {
-    /* Write value of CSR0 to display board for debugging */
-    *(uint32_t *)(0x03000000) = (uint32_t)LANCE_CSR0;
-    // printf("%04X -> ", LANCE_CSR0);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    mac_task_event_t event = MAC_EVT_NONE;
+    __LANCE_CSR0bits_t csr0;
 
-    if (LANCE_CSR0bits.BABL) {
-        /* Handle BABLE event */
+    /* Get the current CSR0 value to work only on the current interrupts */
+    csr0.u16 = LANCE_CSR0;
 
-        LANCE_CSR0bits.BABL = 1;    /* Reset event flag */
+    if (csr0.ERR) {
+        // if (csr0.BABL) {
+        //     /* Handle BABBLE event */
+        // }
+
+        // if (csr0.CERR) {
+        //     /* Handle CERR event */
+        // }
+
+        if (csr0.MISS) {
+            /* Handle MISSED PACKET event - this happens when a packet is
+             * received, but there was no RX descriptor available to place it
+             * into */
+            event = MAC_EVT_PASS;
+        }
+
+        if (csr0.MERR) {
+            /* Handle MEMORY ERROR event - this is fatal for the LANCE, and
+             * disables the transmitter and receiver. In this case, set the
+             * STOP bit in the LANCEs CSR0 register and signal the MAC task
+             * with a shutdown event. */
+            event = MAC_EVT_SHUTDOWN;
+
+            LANCE_stop();
+        }
     }
 
-    if (LANCE_CSR0bits.MISS) {
-        /* Handle MISSED PACKET event */
+    if (event != MAC_EVT_SHUTDOWN && event != MAC_EVT_PASS) {
+        if (csr0.RINT) {
+            /* Handle RECEIVER INTERRUPT event */
+            event = MAC_EVT_RX_COMPLETE;
+        }
 
-        LANCE_CSR0bits.MISS = 1;    /* Reset event flag */
+        if (csr0.TINT) {
+            /* Handle TRANSMITTER INTERRUPT event */
+            event = MAC_EVT_TX_COMPLETE;
+        }
     }
 
-    if (LANCE_CSR0bits.MERR) {
-        /* Handle MEMORY ERROR event */
-
-        LANCE_CSR0bits.MERR = 1;    /* Reset event flag */
+    if (event == MAC_EVT_PASS) {
+        /* Reset back to none */
+        event = MAC_EVT_NONE;
     }
 
-    if (LANCE_CSR0bits.RINT) {
-        /* Handle RECEIVER INTERRUPT event */
-
-        LANCE_CSR0bits.RINT = 1;    /* Reset event flag */
+    if (event) {
+        /* If an event type has been specified, send to the MAC task queue */
+        xQueueSendFromISR(mac_task_queue, &event, &xHigherPriorityTaskWoken);
     }
 
-    if (LANCE_CSR0bits.TINT) {
-        /* Handle TRANSMITTER INTERRUPT event */
-        LANCE_TX_Complete();
+    /* Clear all interrupt/error flags that were captured at the beginning of
+     * the ISR after everything has been handled. New events will generate
+     * anotherinterrupt. */
+    LANCE_CSR0bits.u16 = (csr0.u16 & 0x7E40);
 
-        LANCE_CSR0bits.TINT = 1;    /* Reset event flag */
-    }
-
-    // printf("%04X\r\n", LANCE_CSR0);
+    return xHigherPriorityTaskWoken;
 }
