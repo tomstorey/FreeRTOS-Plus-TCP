@@ -70,13 +70,13 @@ static QueueHandle_t quicc_task_queue = NULL;
 /* This enum lists all the different types of events that can be handled by the
  * QUICC management task */
 typedef enum {
-    QUICC_EVT_PASS = -1,
+    QUICC_EVT_PASS = 0x80000000,
     QUICC_EVT_NONE = 0,
-    QUICC_EVT_TX_ERROR,
-    QUICC_EVT_TX_COMPLETE,
-    QUICC_EVT_RX_INCOMPLETE,
-    QUICC_EVT_RX_COMPLETE,
-    QUICC_EVT_BUFF_MAINT
+    QUICC_EVT_TX_ERROR = 0x1,
+    QUICC_EVT_TX_COMPLETE = 0x2,
+    QUICC_EVT_RX_INCOMPLETE = 0x4,
+    QUICC_EVT_RX_COMPLETE = 0x8,
+    QUICC_EVT_BUFF_MAINT = 0x10
 } quicc_task_event_t;
 
 /* A timer that is started when ever a buffer fails to be allocated for the
@@ -91,6 +91,9 @@ TimerHandle_t quicc_buffer_stats_handle = NULL;
 /* The number of entries the QUICC task queue can hold. Should cover at least
  * the number of buffer descriptors that are allocated */
 #define QUICC_TASK_QUEUE_SZ (ipconfigNUM_NETWORK_BUFFER_DESCRIPTORS + 10)
+
+static volatile uint32_t rx_int = 0;
+static volatile uint32_t tx_int = 0;
 
 /* Forward declarations for private API */
 static void release_allocated_buffers(void);
@@ -413,36 +416,43 @@ quicc_interrupt_handler(void)
 {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     BaseType_t task_woken = pdFALSE;
-    quicc_task_event_t quicc_event = QUICC_EVT_NONE;
 
     /* Get pended interrupts */
     __SCCEEthbits_t events = { .u16 = SCCE1 };
 
     if (events.RXB) {
         /* An incomplete frame has been received into a buffer */
-        quicc_event = QUICC_EVT_RX_INCOMPLETE;
-        xQueueSendFromISR(quicc_task_queue, &quicc_event, &task_woken);
+        xTaskNotifyFromISR(quicc_task_handle,
+                           QUICC_EVT_RX_INCOMPLETE,
+                           eSetBits,
+                           &task_woken);
         xHigherPriorityTaskWoken |= task_woken;
     }
 
     if (events.RXF) {
         /* A complete frame has been received into a buffer */
-        quicc_event = QUICC_EVT_RX_COMPLETE;
-        xQueueSendFromISR(quicc_task_queue, &quicc_event, &task_woken);
+        xTaskNotifyFromISR(quicc_task_handle,
+                           QUICC_EVT_RX_COMPLETE,
+                           eSetBits,
+                           &task_woken);
         xHigherPriorityTaskWoken |= task_woken;
     }
 
     if (events.TXE) {
         /* An error occurred during transmission */
-        quicc_event = QUICC_EVT_TX_ERROR;
-        xQueueSendFromISR(quicc_task_queue, &quicc_event, &task_woken);
+        xTaskNotifyFromISR(quicc_task_handle,
+                           QUICC_EVT_TX_ERROR,
+                           eSetBits,
+                           &task_woken);
         xHigherPriorityTaskWoken |= task_woken;
     }
 
     if (events.TXB) {
         /* A frame has completed transmission */
-        quicc_event = QUICC_EVT_TX_COMPLETE;
-        xQueueSendFromISR(quicc_task_queue, &quicc_event, &task_woken);
+        xTaskNotifyFromISR(quicc_task_handle,
+                           QUICC_EVT_TX_COMPLETE,
+                           eSetBits,
+                           &task_woken);
         xHigherPriorityTaskWoken |= task_woken;
     }
 
@@ -491,60 +501,23 @@ release_allocated_buffers(void)
 static void __attribute__ ((noreturn))
 quicc_task(void * pvParameters)
 {
-    __SCCEthRxBufferDescriptor_t *rd = NULL;
-    NetworkBufferDescriptor_t *pxNetworkBuffer = NULL;
-    quicc_task_event_t event = QUICC_EVT_NONE;
-    uint8_t idx = 0;
+    quicc_task_event_t events = QUICC_EVT_NONE;
 
     while (true) {
-        if (xQueueReceive(quicc_task_queue,
-                          (quicc_task_event_t *)&event,
-                          10) != pdPASS) {
-            /* Failed to get an item from the queue, wait again */
+        /* Wait for some events to be notified */
+        xTaskNotifyWait(0, 0xFFFFFFFF, &events, 10);
+
+        if (events == QUICC_EVT_NONE) {
+            /* No event bits set */
             continue;
         }
 
-        switch (event) {
-            case QUICC_EVT_TX_COMPLETE:
-            case QUICC_EVT_TX_ERROR: quicc_task_tx_events(); break;
+        if (events & QUICC_EVT_TX_COMPLETE || events & QUICC_EVT_TX_ERROR) {
+            quicc_task_tx_events();
+        }
 
-            case QUICC_EVT_RX_INCOMPLETE:
-            case QUICC_EVT_RX_COMPLETE: quicc_task_rx_events(event); break;
-
-            case QUICC_EVT_BUFF_MAINT:
-                /* Perform a pass over the RX ring and allocate any buffers that
-                 * are missing */
-                for (idx = 0; idx < ipconfigQUICC_RX_RING_SZ; idx++){
-                    rd = (__SCCEthRxBufferDescriptor_t *)&rx_ring[idx];
-
-                    if (rd->DST == NULL) {
-                        /* Allocate a new buffer for the ring */
-                        pxNetworkBuffer = pxGetNetworkBufferWithDescriptor(
-                            BUFFER_SIZE_ROUNDED_UP,
-                            0);
-
-                        configASSERT(pxNetworkBuffer != NULL);
-
-                        if (pxNetworkBuffer != NULL) {
-                            /* Configure QUICC BD */
-                            rd->DST = pxNetworkBuffer->pucEthernetBuffer;
-                            rd->flags.u16 |= 0x9000; /* E and I */
-                        } else {
-                            /* Another allocation failure, restart the timer to
-                             * try again later */
-                            xTimerStart(quicc_buffer_realloc_timer_handle, 0);
-
-                            /* TODO: what if the timer doesnt start? */
-
-                            break;
-                        }
-                    }
-                }
-
-                break;
-
-            default:
-                ; /* Ignore any unknown event types */
+        if (events & QUICC_EVT_RX_COMPLETE || events & QUICC_EVT_RX_INCOMPLETE) {
+            quicc_task_rx_events(events);
         }
     }
 }
@@ -552,40 +525,65 @@ quicc_task(void * pvParameters)
 static void
 quicc_task_tx_events(void)
 {
+    /* Handle transmitter events
+     *
+     * Loop through the TX ring and clear out any buffers which have been
+     * transmitted.
+     *
+     * If any buffers produced errors, particularly those which disabled the
+     * transmitter, handle them appropriately. */
+    tx_int++;
+
+    uint8_t idx = 0;
     __SCCEthTxBufferDescriptor_t *td = NULL;
-    uint8_t *buf = NULL;
+    __SCCEthTxBufferDescriptor_t bd;
+    uint8_t *pucEthernetBuffer = NULL;
     NetworkBufferDescriptor_t *pxNetworkBuffer = NULL;
+    uint8_t tx_restarted = false;
 
-    /* Handle transmitter events */
+    for (; idx < ipconfigQUICC_TX_RING_SZ; idx++) {
+        /* Disable interrupts momentarily while copying the flags of a BD into a
+         * local variable - the local variable is used while determining whether
+         * to skip to the next BD so that the state ideally doesnt change under
+         * our feet.
+         * 
+         * The SRC field is not altered by the CPM, so can be referenced
+         * directly. */
+        portDISABLE_INTERRUPTS();
 
-    /* Free the buffer at the tail of the TX ring. Additionally, restart the
-     * transmitter if an error condition has occurred that caused it to be
-     * disabled. */
-    while (true) {
-        /* Assign the td pointer */
-        td = (__SCCEthTxBufferDescriptor_t *) &tx_ring[tx_tail];
+        td = (__SCCEthTxBufferDescriptor_t *)&tx_ring[idx];
+        bd.flags.u16 = td->flags.u16;
 
-        if (td->flags.R == 0 && td->SRC == NULL) {
-            /* BD is empty, no more left to process */
-            break;
+        portENABLE_INTERRUPTS();
+
+        if (bd.flags.R) {
+            /* Buffer is currently in use, skip */
+            continue;
         }
 
-        if (td->flags.u16 & 0x00C2) {
+        if (td->flags.R == 0 && td->SRC == NULL) {
+            /* Buffer has not been used recently, skip */
+            continue;
+        }
+
+        if (td->flags.u16 & 0x00C2 && tx_restarted == false) {
             /* UN || RL || LC - conditions that require the transmitter to be
              * restarted */
             CR = (_CR_OPCODE_SCC_RESTART_TX << _CR_OPCODE_POSITION) |
-                 (_CR_CHNUM_SCC1 << _CR_CHNUM_POSITION) |
-                 1;
+                    (_CR_CHNUM_SCC1 << _CR_CHNUM_POSITION) |
+                    1;
+
+            tx_restarted = true;
         }
 
         /* Assign pointer to the packet buffer within the BD */
-        buf = (uint8_t *) td->SRC;
+        pucEthernetBuffer = (uint8_t *)td->SRC;
 
-        configASSERT(buf != NULL);
+        configASSERT(pucEthernetBuffer != NULL);
 
-        if (buf != NULL) {
+        if (pucEthernetBuffer != NULL) {
             /* Get a pointer to the FreeRTOS BD from the packet buffer */
-            pxNetworkBuffer = pxPacketBuffer_to_NetworkBuffer((void *) buf);
+            pxNetworkBuffer = pxPacketBuffer_to_NetworkBuffer((void *)pucEthernetBuffer);
 
             configASSERT(pxNetworkBuffer != NULL);
 
@@ -599,34 +597,25 @@ quicc_task_tx_events(void)
             td->LEN = 0;
             td->SRC = 0;
         }
-
-        /* Increment and wrap the tail index */
-        tx_tail++;
-
-        if (tx_tail == ipconfigQUICC_TX_RING_SZ) {
-            tx_tail = 0;
-        }
-
-        configASSERT(tx_tail < ipconfigQUICC_TX_RING_SZ);
     }
 }
 
 static void
-quicc_task_rx_events(quicc_task_event_t event)
+quicc_task_rx_events(quicc_task_event_t events)
 {
+    /* Handle receiver events
+     *
+     * Loop through the RX ring and process any frames that have been received.
+     */
+    rx_int++;
+
     __SCCEthRxBufferDescriptor_t *rd = NULL;
-    uint8_t *buf = NULL;
+    uint8_t *pucEthernetBuffer = NULL;
     NetworkBufferDescriptor_t *pxNetworkBuffer = NULL;
     IPStackEvent_t xRxEvent = {0};
 
-    /* Handle receiver events */
-
-    /* Either a frame has been received but with errors, or a valid frame has
-     * been received and should be passed to FreeRTOS. Keep processing until
-     * all pending frames have been handled. */
     while (true) {
-        /* Assign the rd pointer */
-        rd = (__SCCEthRxBufferDescriptor_t *) &rx_ring[rx_tail];
+        rd = (__SCCEthRxBufferDescriptor_t *)&rx_ring[rx_tail];
 
         if (rd->flags.E) {
             /* BD is empty, no more left to process */
@@ -634,71 +623,69 @@ quicc_task_rx_events(quicc_task_event_t event)
         }
 
         /* Assign pointer to the packet buffer within the BD */
-        buf = (uint8_t *) rd->DST;
+        pucEthernetBuffer = (uint8_t *)rd->DST;
 
-        configASSERT(buf != NULL);
+        configASSERT(pucEthernetBuffer != NULL);
 
-        if (buf != NULL) {
+        if (pucEthernetBuffer != NULL) {
             /* Get a pointer to the FreeRTOS BD from the packet buffer */
-            pxNetworkBuffer = pxPacketBuffer_to_NetworkBuffer((void *) buf);
+            pxNetworkBuffer = pxPacketBuffer_to_NetworkBuffer((void *)pucEthernetBuffer);
 
             configASSERT(pxNetworkBuffer != NULL);
 
             if (pxNetworkBuffer != NULL) {
-                /* TODO: drop chained buffers, or implement chained buffers? */
-
-                if (rd->flags.u16 & 0x003F) {
-                    /* LG || NO || SH || CR || OV || CL - Release the buffer and
-                     * descriptor due to error(s) */
-                    vReleaseNetworkBufferAndDescriptor(pxNetworkBuffer);
-                } else if (event == QUICC_EVT_RX_INCOMPLETE) {
-                    /* The received frame is not likely useable, so drop it */
-                    vReleaseNetworkBufferAndDescriptor(pxNetworkBuffer);
+                if (rd->flags.u16 & 0x003F || events & QUICC_EVT_RX_INCOMPLETE) {
+                    /* Frame contents probably are no good, so reset flags to
+                     * make the BD available to receive another frame */
+                    rd->flags.u16 &= 0x2000;
+                    rd->flags.u16 |= 0x9000;
                 } else {
-                    /* Frame is (probably) OK, queue it with FreeRTOS */
+                    /* Frame is probably OK, so try to queue it with FreeRTOS */
                     xRxEvent.eEventType = eNetworkRxEvent;
-                    xRxEvent.pvData = (void *) pxNetworkBuffer;
+                    xRxEvent.pvData = (void *)pxNetworkBuffer;
+
+                    pxNetworkBuffer->xDataLength = rd->LEN;
 
                     if (rd->flags.L) {
-                        /* Subtract CRC from received data length */
-                        pxNetworkBuffer->xDataLength = rd->LEN - 4;
-                    } else {
-                        pxNetworkBuffer->xDataLength = rd->LEN;
+                        /* The last BD belonging to a large frame includes 4
+                         * bytes for the CRC, remove these before passing to
+                         * FreeRTOS */
+                        pxNetworkBuffer->xDataLength -= 4;
                     }
 
-                    if (xSendEventStructToIPTask(&xRxEvent, 0) != pdPASS) {
-                        /* Couldnt pass the event to the IP stack, so drop it */
-                        vReleaseNetworkBufferAndDescriptor(pxNetworkBuffer);
+                    if (xSendEventStructToIPTask(&xRxEvent, 1) == pdPASS) {
+                        /* Successfully queued, reset flags and destination
+                         * pointer ahead of assigning a new buffer */
+                        rd->flags.u16 &= 0x2000;
+                        rd->DST = NULL;
+                    } else {
+                        /* Wasnt able to queue with FreeRTOS, so reset the flags
+                         * to make the BD available to receive another frame */
+                        rd->flags.u16 &= 0x2000;
+                        rd->flags.u16 |= 0x9000;
                     }
                 }
             }
         }
 
-        /* Allocate a new buffer for the ring */
-        pxNetworkBuffer = pxGetNetworkBufferWithDescriptor(
-            BUFFER_SIZE_ROUNDED_UP,
-            0);
+        /* If the destination pointer has been nulled, try to allocate a new
+         * buffer */
+        if (rd->DST == NULL) {
+            pxNetworkBuffer = pxGetNetworkBufferWithDescriptor(
+                BUFFER_SIZE_ROUNDED_UP,
+                1);
 
-        configASSERT(pxNetworkBuffer != NULL);
+            configASSERT(pxNetworkBuffer != NULL);
 
-        rd->flags.u16 &= 0x2000;   /* Clear all flags except W */
-        rd->LEN = 0;
-
-        if (pxNetworkBuffer != NULL) {
-            /* Re-configure QUICC BD with new buffer and flags */
-            rd->DST = pxNetworkBuffer->pucEthernetBuffer;
-            rd->flags.u16 |= 0x9000;
-        } else {
-            /* Clear the destination as an indicator that this BD is missing a
-             * buffer, start the timer to queue a buffer maintenance event */
-            rd->DST = NULL;
-
-            xTimerStart(quicc_buffer_realloc_timer_handle, 0);
-
-            /* TODO: what if the timer doesnt start? */
+            if (pxNetworkBuffer != NULL) {
+                rd->DST = pxNetworkBuffer->pucEthernetBuffer;
+                rd->flags.u16 |= 0x9000;
+            } else {
+                /* TODO: Handle situations where a buffer cant be allocated */
+            }
         }
 
-        /* Increment and wrap the tail index */
+        /* Increment and wrap the tail pointer */
         rx_tail++;
 
         if (rx_tail == ipconfigQUICC_RX_RING_SZ) {
@@ -715,11 +702,7 @@ quicc_buffer_realloc_timer(TimerHandle_t xTimer)
     /* Queue a buffer maintenance event with the QUICC manager task, this will
      * start a process to scan the RX ring and fill in any BDs that have no
      * destination buffer */
-    quicc_task_event_t quicc_event = QUICC_EVT_BUFF_MAINT;
-
-    xQueueSend(quicc_task_queue, &quicc_event, 10);
-
-    /* TODO: what if this event cant be queued? */
+    xTaskNotify(quicc_task_handle, QUICC_EVT_BUFF_MAINT, eSetBits);
 }
 
 static void
@@ -742,6 +725,11 @@ quicc_buffer_stats(TimerHandle_t xTimer)
     uint8_t rx_tail_idx = rx_tail;
     uint8_t tx_tail_idx = tx_tail;
     uint8_t tx_head_idx = tx_head;
+
+    uint32_t rx_ints = rx_int;
+    rx_int = 0;
+    uint32_t tx_ints = tx_int;
+    tx_int = 0;
 
     for (idx = 0; idx < ipconfigQUICC_RX_RING_SZ; idx++) {
         rd = (__SCCEthRxBufferDescriptor_t *)&rx_ring[idx];
@@ -784,6 +772,7 @@ quicc_buffer_stats(TimerHandle_t xTimer)
 
     printf("\r\ngsmr 0x%08x:%08x  psmr 0x%04x  rfbd %04x  tfbd %04x  tlbd %04x\r\n", GSMR1H, GSMR1L, PSMR1, SCC1RFBD_PTR, SCC1TFBD_PTR, SCC1TLBD_PTR);
     printf("crcec %d  alec %d  disfc %d\r\n", SCC1CRCEC, SCC1ALEC, SCC1DISFC);
+    printf("rx_int %d  tx_int %d\r\n", rx_ints, tx_ints);
 
     printf("\r\n");
 }
