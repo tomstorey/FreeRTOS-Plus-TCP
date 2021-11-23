@@ -1,10 +1,5 @@
         .title "SCC1 Interrupt Handler - Ethernet"
 
-#include "../../../../FreeRTOSConfig.h"
-
-#define KERNEL_IPL_INV_MASK ((~configKERNEL_INTERRUPT_PRIORITY & 0x7) << 8)
-#define API_IPL_INV_MASK ((~configMAX_API_CALL_INTERRUPT_PRIORITY & 0x7) << 8)
-
         .extern quicc_interrupt_handler
         .extern vTaskSwitchContext
 
