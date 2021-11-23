@@ -303,7 +303,7 @@ xNetworkInterfaceInitialise(void)
 
     DSR1 = 0xD555;                  /* Frame sync patterns */
 
-    PSMR1 = 0x080A;
+    PSMR1 = 0x080B;
 
     /* Init SCC1 tx/rx params */
     CR = (_CR_OPCODE_SCC_INIT_TX_RX_PARAMS << _CR_OPCODE_POSITION) |
